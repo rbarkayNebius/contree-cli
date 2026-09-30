@@ -538,12 +538,62 @@ class TestHomeOwnership:
         with pytest.raises(config_mod.InsecurePathError, match="owned by uid"):
             Config()
 
-    def test_writable_home_is_tightened(self, config_dir):
+    def test_own_group_writable_home_is_tightened(self, config_dir):
+        home = config_mod.CONTREE_HOME
+        home.mkdir(parents=True)
+        os.chmod(home, 0o770)
+        Config()
+        assert stat.S_IMODE(os.stat(home).st_mode) & 0o022 == 0
+
+    def test_world_writable_home_rejected(self, config_dir):
         home = config_mod.CONTREE_HOME
         home.mkdir(parents=True)
         os.chmod(home, 0o777)
-        Config()
-        assert stat.S_IMODE(os.stat(home).st_mode) & 0o022 == 0
+        with pytest.raises(config_mod.InsecurePathError, match="writable by other"):
+            Config()
+
+    def test_world_writable_cli_ini_rejected(self, config_dir):
+        config_dir.mkdir(parents=True)
+        cli = config_dir / "cli.ini"
+        cli.write_text("[cli]\neditor = touch /tmp/pwned\n")
+        os.chmod(cli, 0o666)
+        with pytest.raises(config_mod.InsecurePathError, match="writable by other"):
+            Config()
+
+    def test_home_in_writable_non_sticky_parent_rejected(self, tmp_path, monkeypatch):
+        parent = tmp_path / "shared"
+        parent.mkdir()
+        os.chmod(parent, 0o777)
+        monkeypatch.setattr(config_mod, "CONTREE_HOME", parent / "home")
+        with pytest.raises(config_mod.InsecurePathError, match="parent of"):
+            Config(parent / "home" / "auth.ini")
+
+    @needs_root
+    def test_import_time_settings_skip_foreign_cli_ini(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir(mode=0o700)
+        cli = home / "cli.ini"
+        cli.write_text("[cli]\neditor = touch /tmp/pwned\n")
+        os.chown(cli, 65534, 65534)
+        monkeypatch.setattr(config_mod, "CONTREE_HOME", home)
+        monkeypatch.setattr(config_mod, "CLI_CONFIG_FILE", cli)
+        monkeypatch.setattr(config_mod, "CONFIG_FILE", home / "auth.ini")
+        settings, err = config_mod._load_settings()
+        assert err is not None
+        assert not settings.has_section("cli")
+
+    @needs_root
+    def test_foreign_intermediate_dir_rejected(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        home.mkdir(mode=0o700)
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        os.chown(evil, 65534, 65534)
+        (home / "cli").symlink_to(evil)
+        monkeypatch.setattr(config_mod, "CONTREE_HOME", home)
+        with pytest.raises(config_mod.InsecurePathError, match="owned by uid"):
+            config_mod.prepare_private_db(home / "cli" / "sessions" / "x.db")
+        assert not (evil / "sessions").exists()
 
     def test_home_created_private(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
@@ -582,6 +632,13 @@ class TestPreparePrivateDb:
         db = tmp_path / "sessions" / "default.db"
         config_mod.prepare_private_db(db)
         assert stat.S_IMODE(os.stat(db).st_mode) == 0o600
+
+    def test_creates_every_home_level_0700(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        monkeypatch.setattr(config_mod, "CONTREE_HOME", home)
+        config_mod.prepare_private_db(home / "cli" / "sessions" / "x.db")
+        for d in (home, home / "cli", home / "cli" / "sessions"):
+            assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
 
     def test_symlinked_wal_rejected(self, tmp_path):
         db = tmp_path / "default.db"

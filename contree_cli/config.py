@@ -92,20 +92,57 @@ def _euid() -> int | None:
     return geteuid() if geteuid is not None else None
 
 
+def _verify(
+    path: Path, st: os.stat_result, uid: int, *, is_dir: bool, home: bool
+) -> None:
+    """Validate the (followed) stat result *st* of *path*.
+
+    It must be of the expected type and owned by us (or, except for the
+    home itself, by root). World-writable is refused. Group-writable
+    is tightened when we own it and the group is our own (umask 002
+    with user-private groups), otherwise refused. A directory we do
+    not own (``/tmp``) may stay writable only when sticky, since files
+    inside are checked individually.
+    """
+    kind_ok = stat.S_ISDIR(st.st_mode) if is_dir else stat.S_ISREG(st.st_mode)
+    if not kind_ok:
+        kind = "directory" if is_dir else "regular file"
+        raise InsecurePathError(f"{path} is not a {kind}")
+    trusted = {uid} if home else {uid, 0}
+    if st.st_uid not in trusted:
+        raise InsecurePathError(
+            f"{path} is owned by uid {st.st_uid}, not by the current user"
+            f" (uid {uid}); refusing to use it"
+        )
+    if not st.st_mode & _GO_WRITE:
+        return
+    if is_dir and not home and st.st_uid != uid and st.st_mode & stat.S_ISVTX:
+        return
+    own_group = st.st_uid == uid and st.st_gid == os.getegid()
+    if st.st_mode & stat.S_IWOTH or not own_group:
+        raise InsecurePathError(
+            f"{path} is writable by other users; refusing to use it"
+            f" (fix with `chmod go-w {path}` after checking its contents)"
+        )
+    log.warning("Removing group write access from %s", path)
+    try:
+        os.chmod(path, stat.S_IMODE(st.st_mode) & ~_GO_WRITE)
+    except OSError as exc:
+        raise InsecurePathError(
+            f"{path} is group-writable and cannot be fixed: {exc}"
+        ) from None
+
+
 def _check(path: Path, *, is_dir: bool, home: bool = False) -> None:
     """Raise :class:`InsecurePathError` unless *path* is safely ours.
 
     A missing path passes (callers create it privately). A symlink is
-    followed only when the link itself is ours or root's. The target
-    must be of the expected type and owned by us (or, except for the
-    home itself, by root). Group/other write access is stripped when
-    we own the path; a directory we do not own may keep it only when
-    sticky (``/tmp``), where files inside are checked individually.
+    followed only when the link itself is ours or root's; the target
+    is then checked by :func:`_verify`.
     """
     uid = _euid()
     if uid is None:  # no POSIX ownership model (Windows)
         return
-    trusted = {uid} if home else {uid, 0}
     try:
         lst = os.lstat(path)
     except FileNotFoundError:
@@ -120,30 +157,7 @@ def _check(path: Path, *, is_dir: bool, home: bool = False) -> None:
         raise InsecurePathError(f"{path} is a dangling symlink") from None
     except OSError as exc:
         raise InsecurePathError(f"cannot inspect {path}: {exc}") from None
-    kind_ok = stat.S_ISDIR(st.st_mode) if is_dir else stat.S_ISREG(st.st_mode)
-    if not kind_ok:
-        kind = "directory" if is_dir else "regular file"
-        raise InsecurePathError(f"{path} is not a {kind}")
-    if st.st_uid not in trusted:
-        raise InsecurePathError(
-            f"{path} is owned by uid {st.st_uid}, not by the current user"
-            f" (uid {uid}); refusing to use it"
-        )
-    if not st.st_mode & _GO_WRITE:
-        return
-    if st.st_uid == uid:
-        mode = stat.S_IMODE(st.st_mode) & ~_GO_WRITE
-        log.warning("Removing group/other write access from %s", path)
-        try:
-            os.chmod(path, mode)
-        except OSError as exc:
-            raise InsecurePathError(
-                f"{path} is writable by other users and cannot be fixed: {exc}"
-            ) from None
-        return
-    if is_dir and not home and st.st_mode & stat.S_ISVTX:
-        return
-    raise InsecurePathError(f"{path} is writable by other users; refusing to use it")
+    _verify(path, st, uid, is_dir=is_dir, home=home)
 
 
 def check_dir(path: Path, *, home: bool = False) -> None:
@@ -154,10 +168,54 @@ def check_file(path: Path) -> None:
     _check(path, is_dir=False)
 
 
+def _check_home_parent(home: Path) -> None:
+    """Refuse a home whose parent lets another user swap it out.
+
+    Whoever can write to a non-sticky parent can rename the home away
+    and put their own in its place.
+    """
+    uid = _euid()
+    if uid is None:
+        return
+    try:
+        st = os.stat(home.parent)
+    except OSError:
+        return
+    if st.st_mode & stat.S_ISVTX:
+        return
+    if st.st_uid not in {uid, 0}:
+        raise InsecurePathError(
+            f"{home.parent} (parent of CONTREE_HOME) is owned by uid"
+            f" {st.st_uid}, not by the current user (uid {uid})"
+        )
+    others = st.st_mode & stat.S_IWOTH or (
+        st.st_mode & stat.S_IWGRP and st.st_gid != os.getegid()
+    )
+    if others:
+        raise InsecurePathError(
+            f"{home.parent} (parent of CONTREE_HOME) is writable by other users"
+        )
+
+
 def ensure_private_dir(path: Path) -> None:
-    """Create *path* with mode 0700 if missing, then verify it is ours."""
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    check_dir(path, home=path == CONTREE_HOME)
+    """Create *path* (mode 0700 per level) if missing and verify it.
+
+    Under CONTREE_HOME every level from the home down is created 0700
+    and checked, so an intermediate directory (e.g. ``cli``) owned by
+    someone else is not trusted just because its child is ours.
+    """
+    home = CONTREE_HOME
+    if path == home or home in path.parents:
+        home.parent.mkdir(parents=True, exist_ok=True)
+        levels = [home]
+        for part in path.relative_to(home).parts:
+            levels.append(levels[-1] / part)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        levels = [path]
+    for level in levels:
+        level.mkdir(mode=0o700, exist_ok=True)
+        check_dir(level, home=level == home)
 
 
 def write_private(path: Path, data: str) -> None:
@@ -172,6 +230,8 @@ def write_private(path: Path, data: str) -> None:
     try:
         with os.fdopen(fd, "w") as f:
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         with suppress(OSError):
@@ -201,24 +261,44 @@ def prepare_private_db(db_path: Path) -> None:
     os.close(fd)
 
 
-def _check_home_files() -> InsecurePathError | None:
+def _read_trusted(path: Path) -> str | None:
+    """Read *path* only if the file actually opened is ours.
+
+    The pre-open check rejects foreign symlinks; the ``fstat`` of the
+    open descriptor closes the gap in which the path could be swapped.
+    Missing or unreadable files yield None, like ``ConfigParser.read``.
+    """
+    check_file(path)
+    try:
+        f = open(path)  # noqa: SIM115
+    except OSError:
+        return None
+    with f:
+        uid = _euid()
+        if uid is not None:
+            _verify(path, os.fstat(f.fileno()), uid, is_dir=False, home=False)
+        return f.read()
+
+
+def _load_settings() -> tuple[configparser.ConfigParser, InsecurePathError | None]:
+    settings = configparser.ConfigParser()
     try:
         check_dir(CONTREE_HOME, home=True)
-        check_file(CLI_CONFIG_FILE)
-        check_file(CONFIG_FILE)
+        _check_home_parent(CONTREE_HOME)
+        for path in (CLI_CONFIG_FILE, CONFIG_FILE):
+            text = _read_trusted(path)
+            if text is not None:
+                settings.read_string(text, source=str(path))
     except InsecurePathError as exc:
-        return exc
-    return None
+        return configparser.ConfigParser(), exc
+    return settings, None
 
 
 # Parsed at import time. Paths are fixed by CONTREE_HOME (env), so the
 # ``[cli]`` section is available before argparse runs and can supply
 # defaults that beat hardcoded ones but still lose to flags. Nothing is
 # read from a home that fails the ownership checks; main() reports it.
-SETTINGS = configparser.ConfigParser()
-HOME_ERROR = _check_home_files()
-if HOME_ERROR is None:
-    SETTINGS.read([CLI_CONFIG_FILE, CONFIG_FILE])
+SETTINGS, HOME_ERROR = _load_settings()
 
 
 def check_home() -> None:
@@ -229,8 +309,7 @@ def check_home() -> None:
             " and not writable by others (e.g. ~/.config/contree)."
         )
     with suppress(OSError):
-        parent = os.stat(CONTREE_HOME.parent)
-        if parent.st_mode & stat.S_IWOTH:
+        if os.stat(CONTREE_HOME.parent).st_mode & stat.S_IWOTH:
             log.warning(
                 "CONTREE_HOME %s is inside world-writable directory %s;"
                 " use a private location such as ~/.config/contree",
@@ -276,7 +355,10 @@ class Config(MutableMapping[str, Profile]):
     """
 
     def __init__(self, path: Path | None = None) -> None:
-        check_dir(CONTREE_HOME, home=True)
+        # Create the home now (0700) so it cannot appear, owned by
+        # someone else, between this check and the reads below.
+        _check_home_parent(CONTREE_HOME)
+        ensure_private_dir(CONTREE_HOME)
         run_migrations(CONTREE_HOME)
         self.__path = path or CONFIG_FILE
         # The library reads the sibling cli.ini alongside auth.ini.

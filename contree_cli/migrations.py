@@ -76,10 +76,10 @@ def migrate_into_cli_subdir(home: Path) -> None:
             continue
         if item.name.startswith("sessions-"):
             target = sessions_dir / item.name[len("sessions-") :]
-            sessions_dir.mkdir(parents=True, exist_ok=True)
+            sessions_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         elif item.name.startswith("skills.db"):
             target = cli_dir / item.name
-            cli_dir.mkdir(parents=True, exist_ok=True)
+            cli_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         else:
             continue
 
