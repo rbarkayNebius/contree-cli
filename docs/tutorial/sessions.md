@@ -244,12 +244,18 @@ and does not require manual session key export.
 ## Storage
 
 Session data is stored in a per-profile SQLite database at
-`~/.config/contree/sessions-{profile}.db`. Override the data
+`~/.config/contree/cli/sessions/{profile}.db`. Override the data
 directory with `CONTREE_HOME`:
 
 ```bash
-export CONTREE_HOME=/tmp/contree-data
+export CONTREE_HOME="$HOME/.local/share/contree-data"
 ```
+
+`CONTREE_HOME` holds your credentials, so point it at a directory only
+you can write to. Never use a fixed name under a shared directory such
+as `/tmp`: another user could create it first. The CLI refuses to use a
+`CONTREE_HOME` (or files in it) owned by another user or writable by
+others.
 
 ---
 

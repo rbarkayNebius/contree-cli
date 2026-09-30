@@ -12,13 +12,18 @@ import contree_cli.config as config_mod
 from contree_cli import CLIENT, FORMATTER, PROFILE, SESSION_STORE, ArgumentsProtocol
 from contree_cli.arguments import parser
 from contree_cli.client import client_from_profile
-from contree_cli.config import SETTINGS, Config
+from contree_cli.config import SETTINGS, Config, InsecurePathError
 from contree_cli.log import setup_logging
 from contree_cli.output import FORMATTERS
 from contree_cli.session import SessionStore, get_session_key
 from contree_cli.update_check import UpdateChecker
 
 log = logging.getLogger(__name__)
+
+# The only ``[cli]`` keys honoured as argparse defaults. Anything that
+# routes credentials (url, token, project, profile, config_path,
+# session_key) or dispatch (command, handler) must come from flags.
+CLI_SETTINGS_KEYS = frozenset({"log_level", "output_format", "editor"})
 
 # Network errors raised by the auto-detected transport backend. The
 # stdlib ones are always available; urllib3/httpx raise their own
@@ -46,11 +51,34 @@ def main() -> None:
         parser.print_help()
         exit(0)
 
+    ignored_settings: list[str] = []
     if SETTINGS.has_section("cli"):
-        parser.set_defaults(**SETTINGS["cli"])
+        cli_settings = SETTINGS["cli"]
+        parser.set_defaults(
+            **{k: v for k, v in cli_settings.items() if k in CLI_SETTINGS_KEYS}
+        )
+        # Keys inherited from [DEFAULT] (e.g. auth.ini's ``profile``)
+        # are not [cli] settings; don't warn about them.
+        ignored_settings = sorted(
+            k
+            for k in cli_settings
+            if k not in CLI_SETTINGS_KEYS and k not in SETTINGS.defaults()
+        )
 
     args = parser.parse_args()
     setup_logging(level=getattr(logging, args.log_level.upper(), logging.INFO))
+
+    if ignored_settings:
+        log.warning(
+            "Ignoring unsupported [cli] keys in cli.ini: %s (supported: %s)",
+            ", ".join(ignored_settings),
+            ", ".join(sorted(CLI_SETTINGS_KEYS)),
+        )
+    try:
+        config_mod.check_home()
+    except InsecurePathError as exc:
+        log.error("%s", exc)
+        exit(1)
 
     # Update check runs only after argparse so it skips --help / --version
     # / no-command paths and so the warning respects --log-level. refresh()
@@ -70,7 +98,11 @@ def main() -> None:
     config_mod.CONFIG_FILE = args.config_path
     config_mod.CONFIG_DIR = args.config_path.parent
 
-    cfg = Config(args.config_path)
+    try:
+        cfg = Config(args.config_path)
+    except InsecurePathError as exc:
+        log.error("%s", exc)
+        exit(1)
     profile = cfg.resolve(profile_override=args.profile)
 
     # CLI flags override resolved profile fields
@@ -126,7 +158,12 @@ def main() -> None:
 
         PROFILE.set(profile)
         FORMATTER.set(formatter)
-        SESSION_STORE.set(stack.enter_context(SessionStore(db_path, session_key)))
+        try:
+            store = SessionStore(db_path, session_key)
+        except InsecurePathError as exc:
+            log.error("%s", exc)
+            exit(1)
+        SESSION_STORE.set(stack.enter_context(store))
         ctx = contextvars.copy_context()
 
         loader: type[ArgumentsProtocol] = args.load_args

@@ -67,7 +67,7 @@ def default_agents_home() -> Path:
 @contextmanager
 def connect_registry() -> Iterator[sqlite3.Connection]:
     db_path = config_mod.CONTREE_HOME / "cli" / "skills.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    config_mod.prepare_private_db(db_path)
     conn = sqlite3.connect(str(db_path), timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")

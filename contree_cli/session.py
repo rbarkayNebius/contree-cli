@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path, PurePosixPath
 
+from contree_cli.config import prepare_private_db
+
 CONTREE_CONCURRENCY = int(os.getenv("CONTREE_CONCURRENCY", "8"))
 CONTREE_DB_TIMEOUT = float(os.getenv("CONTREE_DB_TIMEOUT", "30"))
 
@@ -277,7 +279,7 @@ class SessionStore:
 
     def __init__(self, db_path: Path, session_key: str) -> None:
         self._session_key = session_key
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        prepare_private_db(db_path)
         self._conn = sqlite3.connect(str(db_path), timeout=CONTREE_DB_TIMEOUT)
         self._conn.row_factory = sqlite3.Row
         # WAL: concurrent readers + one writer; safe across processes.

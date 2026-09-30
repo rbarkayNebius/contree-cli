@@ -342,3 +342,15 @@ class TestFetchLatestVersion:
         checker = UpdateChecker(state_path=tmp_path / "v.json", current_version="0")
         with patch("urllib.request.urlopen", return_value=self.fake_response(b"[]")):
             assert checker.fetch_latest_version() is None
+
+
+def test_to_file_replaces_symlink_instead_of_following(tmp_path) -> None:
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    state_path = tmp_path / "cli" / "version_check.json"
+    state_path.parent.mkdir()
+    state_path.symlink_to(victim)
+    UpdateState(last_check=1, latest_version="9.9.9").to_file(state_path)
+    assert victim.read_text() == "keep me"
+    assert not state_path.is_symlink()
+    assert UpdateState.from_file(state_path).latest_version == "9.9.9"

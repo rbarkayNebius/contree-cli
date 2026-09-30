@@ -144,3 +144,51 @@ class TestClientLifecycle:
         run_main(monkeypatch, cfg_path, events, "agent")
 
         assert events == []
+
+
+class TestCliSettingsRouting:
+    """A ``[cli]`` section must not redirect where the saved token goes."""
+
+    def test_cli_ini_url_and_token_ignored(self, tmp_path, monkeypatch, capsys):
+        import configparser
+
+        cfg_path = write_profile(tmp_path)
+        settings = configparser.ConfigParser()
+        settings.read_string(
+            "[cli]\nurl = https://evil.example\ntoken = evil\nproject = p\n"
+        )
+        monkeypatch.setattr("contree_cli.__main__.SETTINGS", settings)
+        seen: list[Profile] = []
+        monkeypatch.setattr("contree_cli.__main__.UpdateChecker", DummyChecker)
+
+        def fake_client(profile: Profile, timeout: float = 300.0) -> SpyClient:
+            seen.append(profile)
+            return SpyClient([])
+
+        monkeypatch.setattr("contree_cli.__main__.client_from_profile", fake_client)
+        monkeypatch.setattr(
+            sys, "argv", ["contree", "--config", str(cfg_path), "images"]
+        )
+        try:
+            with pytest.raises(SystemExit):
+                main()
+        finally:
+            from contree_cli.arguments import parser
+
+            parser.set_defaults(url=None, token=None, project=None)
+        assert seen[0].url == "https://contree.dev"
+        assert seen[0].token == "tok"
+        assert "Ignoring unsupported [cli] keys" in capsys.readouterr().err
+
+    def test_untrusted_home_exits(self, tmp_path, monkeypatch, capsys):
+        import contree_cli.config as config_mod
+
+        cfg_path = write_profile(tmp_path)
+        monkeypatch.setattr(
+            config_mod,
+            "HOME_ERROR",
+            config_mod.InsecurePathError("/tmp/x is owned by uid 65534"),
+        )
+        exc = run_main(monkeypatch, cfg_path, [], "images")
+        assert exc.value.code == 1
+        assert "uid 65534" in capsys.readouterr().err

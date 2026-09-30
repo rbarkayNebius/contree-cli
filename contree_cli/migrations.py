@@ -41,7 +41,7 @@ def migrate_legacy_dir(home: Path) -> None:
         return
 
     log.info("Migrating CONTREE_HOME: %s -> %s", legacy_dir, home)
-    home.mkdir(parents=True, exist_ok=True)
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     for item in legacy_dir.iterdir():
         target_name = "auth.ini" if item.name == LEGACY_CONFIG_BASENAME else item.name

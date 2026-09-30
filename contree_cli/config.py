@@ -11,11 +11,14 @@ choice and the session database layout.
 from __future__ import annotations
 
 import configparser
+import io
 import logging
 import os
 import shutil
 import stat
+import tempfile
 from collections.abc import Iterator, MutableMapping
+from contextlib import suppress
 from pathlib import Path
 
 from contree_client.profiles import (
@@ -41,10 +44,17 @@ __all__ = [
     "EDITOR",
     "SETTINGS",
     "Config",
+    "InsecurePathError",
     "Profile",
+    "check_dir",
+    "check_file",
+    "check_home",
+    "ensure_private_dir",
     "get_default_path",
+    "prepare_private_db",
     "remove_session_db",
     "session_db_path",
+    "write_private",
 ]
 
 log = logging.getLogger(__name__)
@@ -60,11 +70,174 @@ CONFIG_DIR = CONTREE_HOME
 CONFIG_FILE = CONTREE_HOME / "auth.ini"
 CLI_CONFIG_FILE = CONTREE_HOME / "cli.ini"
 
+
+# -- ownership checks ----------------------------------------------------------
+#
+# Everything under CONTREE_HOME is trusted as the invoking user's own
+# state (credentials, argparse defaults, the editor command, session
+# data), so it must actually be theirs: a directory another local user
+# created first (e.g. a predictable name under /tmp) must never become
+# the CLI's configuration source or write target.
+
+
+class InsecurePathError(Exception):
+    """A path under CONTREE_HOME is not safely owned by the current user."""
+
+
+_GO_WRITE = stat.S_IWGRP | stat.S_IWOTH
+
+
+def _euid() -> int | None:
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid() if geteuid is not None else None
+
+
+def _check(path: Path, *, is_dir: bool, home: bool = False) -> None:
+    """Raise :class:`InsecurePathError` unless *path* is safely ours.
+
+    A missing path passes (callers create it privately). A symlink is
+    followed only when the link itself is ours or root's. The target
+    must be of the expected type and owned by us (or, except for the
+    home itself, by root). Group/other write access is stripped when
+    we own the path; a directory we do not own may keep it only when
+    sticky (``/tmp``), where files inside are checked individually.
+    """
+    uid = _euid()
+    if uid is None:  # no POSIX ownership model (Windows)
+        return
+    trusted = {uid} if home else {uid, 0}
+    try:
+        lst = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise InsecurePathError(f"cannot inspect {path}: {exc}") from None
+    if stat.S_ISLNK(lst.st_mode) and lst.st_uid not in {uid, 0}:
+        raise InsecurePathError(f"{path} is a symlink owned by uid {lst.st_uid}")
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        raise InsecurePathError(f"{path} is a dangling symlink") from None
+    except OSError as exc:
+        raise InsecurePathError(f"cannot inspect {path}: {exc}") from None
+    kind_ok = stat.S_ISDIR(st.st_mode) if is_dir else stat.S_ISREG(st.st_mode)
+    if not kind_ok:
+        kind = "directory" if is_dir else "regular file"
+        raise InsecurePathError(f"{path} is not a {kind}")
+    if st.st_uid not in trusted:
+        raise InsecurePathError(
+            f"{path} is owned by uid {st.st_uid}, not by the current user"
+            f" (uid {uid}); refusing to use it"
+        )
+    if not st.st_mode & _GO_WRITE:
+        return
+    if st.st_uid == uid:
+        mode = stat.S_IMODE(st.st_mode) & ~_GO_WRITE
+        log.warning("Removing group/other write access from %s", path)
+        try:
+            os.chmod(path, mode)
+        except OSError as exc:
+            raise InsecurePathError(
+                f"{path} is writable by other users and cannot be fixed: {exc}"
+            ) from None
+        return
+    if is_dir and not home and st.st_mode & stat.S_ISVTX:
+        return
+    raise InsecurePathError(f"{path} is writable by other users; refusing to use it")
+
+
+def check_dir(path: Path, *, home: bool = False) -> None:
+    _check(path, is_dir=True, home=home)
+
+
+def check_file(path: Path) -> None:
+    _check(path, is_dir=False)
+
+
+def ensure_private_dir(path: Path) -> None:
+    """Create *path* with mode 0700 if missing, then verify it is ours."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    check_dir(path, home=path == CONTREE_HOME)
+
+
+def write_private(path: Path, data: str) -> None:
+    """Atomically replace *path* with *data*, readable only by us.
+
+    The content goes to a fresh 0600 ``mkstemp`` file in the same
+    directory which is then renamed over *path*, so an existing file
+    or symlink at *path* is replaced, never written through, and no
+    byte is written before the mode is established.
+    """
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def prepare_private_db(db_path: Path) -> None:
+    """Make *db_path* safe to hand to ``sqlite3.connect``.
+
+    The parent directory is created privately and verified, existing
+    database/journal files must be ours, and a missing database is
+    pre-created with mode 0600 (SQLite gives its journal files the
+    database's mode).
+    """
+    ensure_private_dir(db_path.parent)
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        check_file(db_path.with_name(db_path.name + suffix))
+    try:
+        fd = os.open(
+            db_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+    except FileExistsError:
+        return
+    os.close(fd)
+
+
+def _check_home_files() -> InsecurePathError | None:
+    try:
+        check_dir(CONTREE_HOME, home=True)
+        check_file(CLI_CONFIG_FILE)
+        check_file(CONFIG_FILE)
+    except InsecurePathError as exc:
+        return exc
+    return None
+
+
 # Parsed at import time. Paths are fixed by CONTREE_HOME (env), so the
 # ``[cli]`` section is available before argparse runs and can supply
-# defaults that beat hardcoded ones but still lose to flags.
+# defaults that beat hardcoded ones but still lose to flags. Nothing is
+# read from a home that fails the ownership checks; main() reports it.
 SETTINGS = configparser.ConfigParser()
-SETTINGS.read([CLI_CONFIG_FILE, CONFIG_FILE])
+HOME_ERROR = _check_home_files()
+if HOME_ERROR is None:
+    SETTINGS.read([CLI_CONFIG_FILE, CONFIG_FILE])
+
+
+def check_home() -> None:
+    """Raise if CONTREE_HOME failed the import-time ownership checks."""
+    if HOME_ERROR is not None:
+        raise InsecurePathError(
+            f"{HOME_ERROR}. CONTREE_HOME must be a directory owned by you"
+            " and not writable by others (e.g. ~/.config/contree)."
+        )
+    with suppress(OSError):
+        parent = os.stat(CONTREE_HOME.parent)
+        if parent.st_mode & stat.S_IWOTH:
+            log.warning(
+                "CONTREE_HOME %s is inside world-writable directory %s;"
+                " use a private location such as ~/.config/contree",
+                CONTREE_HOME,
+                CONTREE_HOME.parent,
+            )
+
 
 # Default editor for ``contree file edit`` when ``--editor`` is not given.
 # Resolved once at import time. Priority: $EDITOR > cli.ini > vim > nano > vi.
@@ -103,8 +276,13 @@ class Config(MutableMapping[str, Profile]):
     """
 
     def __init__(self, path: Path | None = None) -> None:
+        check_dir(CONTREE_HOME, home=True)
         run_migrations(CONTREE_HOME)
         self.__path = path or CONFIG_FILE
+        # The library reads the sibling cli.ini alongside auth.ini.
+        check_dir(self.__path.parent, home=self.__path.parent == CONTREE_HOME)
+        check_file(self.__path.parent / "cli.ini")
+        check_file(self.__path)
         self.__profiles: dict[str, Profile] = {}
         self.__active: str = "default"
         self._load()
@@ -124,17 +302,13 @@ class Config(MutableMapping[str, Profile]):
         cp["DEFAULT"]["profile"] = self.__active
         for profile in self.__profiles.values():
             profile.save(cp)
-        self.__path.parent.mkdir(parents=True, exist_ok=True)
-        # Create with 0o600 from the start so the token is never readable
-        # by other users — even between create() and chmod().
-        fd = os.open(
-            self.__path,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            stat.S_IRUSR | stat.S_IWUSR,
-        )
-        with os.fdopen(fd, "w") as f:
-            cp.write(f)
-        os.chmod(self.__path, stat.S_IRUSR | stat.S_IWUSR)
+        ensure_private_dir(self.__path.parent)
+        buf = io.StringIO()
+        cp.write(buf)
+        # 0600 temp file renamed over auth.ini: the token is never
+        # readable by others and an existing file/symlink is replaced,
+        # not written through.
+        write_private(self.__path, buf.getvalue())
 
     # -- MutableMapping interface --------------------------------------------
 

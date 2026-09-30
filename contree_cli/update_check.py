@@ -39,6 +39,7 @@ class UpdateState:
     @classmethod
     def from_file(cls, path: Path) -> UpdateState:
         try:
+            config.check_file(path)
             with path.open() as f:
                 data = json.load(f)
             return cls(
@@ -49,9 +50,9 @@ class UpdateState:
             return cls()
 
     def to_file(self, path: Path) -> None:
-        with suppress(OSError):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(asdict(self), indent=1))
+        with suppress(OSError, config.InsecurePathError):
+            config.ensure_private_dir(path.parent)
+            config.write_private(path, json.dumps(asdict(self), indent=1))
 
 
 class UpdateChecker:

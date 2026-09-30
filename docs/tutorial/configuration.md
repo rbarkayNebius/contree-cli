@@ -175,6 +175,10 @@ Override with `$CONTREE_HOME`:
 export CONTREE_HOME=/custom/path
 ```
 
+The directory, and every file the CLI reads or writes in it, must be
+owned by you and not writable by other users; otherwise the CLI refuses
+to run. Missing directories are created with mode `0700`.
+
 ### `cli.ini`
 
 `cli.ini` is meant for hand-editing. Create it yourself; the CLI never
@@ -202,6 +206,10 @@ editor = nvim
 
 Precedence: CLI flag > environment variable > `cli.ini` > built-in
 default. A `cli.ini` setting always loses to an explicit flag.
+
+Only the keys above are honoured. Other keys (for example `url`,
+`token`, `project` or `config_path`) are ignored with a warning; pass
+those as flags or store them in a profile.
 
 #### `[profile:NAME]` sections: CLI-scoped profiles
 

@@ -501,3 +501,98 @@ class TestSessionDbPath:
             config_mod.session_db_path("default")
             == Path("~/custom-session.db").expanduser()
         )
+
+
+# ---------------------------------------------------------------------------
+# CONTREE_HOME ownership checks
+# ---------------------------------------------------------------------------
+
+needs_root = pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="chown to another uid requires root",
+)
+
+
+class TestHomeOwnership:
+    def test_home_owned_by_other_user_rejected(self, config_dir, monkeypatch):
+        config_mod.CONTREE_HOME.mkdir(parents=True)
+        monkeypatch.setattr(config_mod, "_euid", lambda: os.geteuid() + 1000)
+        with pytest.raises(config_mod.InsecurePathError, match="owned by uid"):
+            Config()
+
+    @needs_root
+    def test_foreign_auth_ini_rejected(self, config_dir):
+        config_dir.mkdir(parents=True)
+        auth = config_dir / "auth.ini"
+        auth.write_text("[profile:default]\nurl = https://evil.example\n")
+        os.chown(auth, 65534, 65534)
+        with pytest.raises(config_mod.InsecurePathError, match="owned by uid"):
+            Config()
+
+    @needs_root
+    def test_foreign_cli_ini_rejected(self, config_dir):
+        config_dir.mkdir(parents=True)
+        cli = config_dir / "cli.ini"
+        cli.write_text("[profile:default]\nurl = https://evil.example\n")
+        os.chown(cli, 65534, 65534)
+        with pytest.raises(config_mod.InsecurePathError, match="owned by uid"):
+            Config()
+
+    def test_writable_home_is_tightened(self, config_dir):
+        home = config_mod.CONTREE_HOME
+        home.mkdir(parents=True)
+        os.chmod(home, 0o777)
+        Config()
+        assert stat.S_IMODE(os.stat(home).st_mode) & 0o022 == 0
+
+    def test_home_created_private(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        monkeypatch.setattr(config_mod, "CONTREE_HOME", home)
+        cfg = Config(home / "auth.ini")
+        cfg["default"] = Profile(name="default", token="t", url="https://x.dev")
+        assert stat.S_IMODE(os.stat(home).st_mode) == 0o700
+
+    def test_save_replaces_symlink_instead_of_following(self, config_dir):
+        config_dir.mkdir(parents=True)
+        victim = config_dir.parent / "victim.txt"
+        victim.write_text("[keep]\nme = 1\n")
+        auth = config_dir / "auth.ini"
+        auth.symlink_to(victim)
+        cfg = Config()
+        cfg["default"] = Profile(name="default", token="t", url="https://x.dev")
+        assert victim.read_text() == "[keep]\nme = 1\n"
+        assert not auth.is_symlink()
+        assert stat.S_IMODE(os.stat(auth).st_mode) == 0o600
+
+    def test_dangling_symlink_rejected(self, config_dir):
+        config_dir.mkdir(parents=True)
+        (config_dir / "auth.ini").symlink_to(config_dir / "missing")
+        with pytest.raises(config_mod.InsecurePathError, match="dangling"):
+            Config()
+
+    def test_check_home_reports_import_time_error(self, monkeypatch):
+        err = config_mod.InsecurePathError("/tmp/x is owned by uid 65534")
+        monkeypatch.setattr(config_mod, "HOME_ERROR", err)
+        with pytest.raises(config_mod.InsecurePathError, match="uid 65534"):
+            config_mod.check_home()
+
+
+class TestPreparePrivateDb:
+    def test_creates_db_with_0600(self, tmp_path):
+        db = tmp_path / "sessions" / "default.db"
+        config_mod.prepare_private_db(db)
+        assert stat.S_IMODE(os.stat(db).st_mode) == 0o600
+
+    def test_symlinked_wal_rejected(self, tmp_path):
+        db = tmp_path / "default.db"
+        (tmp_path / "default.db-wal").symlink_to(tmp_path / "nowhere")
+        with pytest.raises(config_mod.InsecurePathError):
+            config_mod.prepare_private_db(db)
+
+    @needs_root
+    def test_foreign_db_rejected(self, tmp_path):
+        db = tmp_path / "default.db"
+        db.write_bytes(b"")
+        os.chown(db, 65534, 65534)
+        with pytest.raises(config_mod.InsecurePathError, match="owned by uid"):
+            config_mod.prepare_private_db(db)
